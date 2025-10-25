@@ -1,0 +1,115 @@
+name: LKS Dev Pipeline
+
+on:
+  push:
+    branches:
+      - "dev"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: lks-voting-image
+  ENV: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build and Push Docker Images to ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Docker Version
+        run: docker --version
+
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and Push Images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "Building and pushing images to $ECR_REGISTRY..."
+          for service in vote result worker; do
+            IMAGE_TAG="${service}-${{ env.ENV }}-latest"
+            echo "Building image for $service..."
+            docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -f "$service/Dockerfile" "./$service"
+            docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          done
+
+  pull-images:
+    name: Pull Images on All Nodes
+    runs-on: ${{ matrix.node }}
+    strategy:
+      matrix:
+        node: [master, node1, node2]
+    needs: build
+    steps:
+      - name: Check Docker Version
+        run: docker --version
+
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Pull Docker Images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        run: |
+          echo "Pulling images on $(hostname)..."
+          for service in vote result worker; do
+            IMAGE_TAG="${service}-${{ env.ENV }}-latest"
+            echo "Pulling $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          done
+
+  deploy:
+    name: Deploy Stack on Docker Swarm (Development)
+    runs-on: master
+    needs: pull-images
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Stack
+        run: |
+          echo "Redeploying Docker Swarm stack..."
+          docker stack rm vote || true
+          sleep 20
+          docker stack deploy -c docker-stack.yml vote
+          echo "Stack deployed successfully."
+          docker stack ps vote
+          docker service ls
