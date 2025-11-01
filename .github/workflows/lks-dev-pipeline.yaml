@@ -1,15 +1,25 @@
-name: LKS Dev Pipeline
+name: LKS Prod Pipeline
 
 on:
   push:
     branches:
-      - "dev"
+      - "prod"
   workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: lks-voting-image
-  ENV: dev
+  ECS_CLUSTER: lks-voting-cluster
+  ECS_SERVICE_VOTE: lks-vote-service
+  ECS_SERVICE_RESULT: lks-result-service
+  ECS_SERVICE_WORKER: lks-workers-service
+  TASK_DEF_VOTE: vote/task-definition.json
+  TASK_DEF_RESULT: result/task-definition.json
+  TASK_DEF_WORKER: worker/task-definition.json
+  CONTAINER_VOTE: lks-vote-container
+  CONTAINER_RESULT: lks-result-container
+  CONTAINER_WORKER: lks-workers-container
+  ENV: "prod"
 
 permissions:
   id-token: write
@@ -17,13 +27,11 @@ permissions:
 
 jobs:
   build:
-    name: Build and Push Docker Images to ECR
+    name: Build and Push Docker Images to ECR (Production)
     runs-on: ubuntu-latest
+    environment: Production
     steps:
-      - name: Check Docker Version
-        run: docker --version
-
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v3
 
       - name: Configure AWS Credentials
@@ -39,29 +47,25 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v1
 
       - name: Build and Push Images
+        id: build-images
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          echo "Building and pushing images to $ECR_REGISTRY..."
+          echo "Building and pushing Docker images for Production..."
           for service in vote result worker; do
             IMAGE_TAG="${service}-${{ env.ENV }}-latest"
             echo "Building image for $service..."
-            docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -f "$service/Dockerfile" "./$service"
-            docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG -f $service/Dockerfile ./$service
+            docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
           done
 
-  pull-images:
-    name: Pull Images on All Nodes
-    runs-on: ${{ matrix.node }}
-    strategy:
-      matrix:
-        node: [master, node1, node2]
+  deploy:
+    name: Deploy Application to Amazon ECS (Production)
+    runs-on: ubuntu-latest
     needs: build
+    environment: Production
     steps:
-      - name: Check Docker Version
-        run: docker --version
-
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v3
 
       - name: Configure AWS Credentials
@@ -76,26 +80,72 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Pull Docker Images
+      - name: Set Image Variables
+        id: set-images
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
         run: |
-          echo "Pulling images on $(hostname)..."
-          for service in vote result worker; do
-            IMAGE_TAG="${service}-${{ env.ENV }}-latest"
-            echo "Pulling $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-            docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          done
+          echo "::set-output name=vote_image::$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:vote-${{ env.ENV }}-latest"
+          echo "::set-output name=result_image::$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:result-${{ env.ENV }}-latest"
+          echo "::set-output name=worker_image::$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:worker-${{ env.ENV }}-latest"
 
-  deploy:
-    name: Deploy Stack on Docker Swarm (Development)
-    runs-on: master
-    needs: pull-images
+      - name: Render ECS Task Definition (Vote)
+        id: render-vote
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEF_VOTE }}
+          container-name: ${{ env.CONTAINER_VOTE }}
+          image: ${{ steps.set-images.outputs.vote_image }}
+
+      - name: Deploy ECS Task Definition (Vote)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-vote.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_VOTE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Render ECS Task Definition (Result)
+        id: render-result
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEF_RESULT }}
+          container-name: ${{ env.CONTAINER_RESULT }}
+          image: ${{ steps.set-images.outputs.result_image }}
+
+      - name: Deploy ECS Task Definition (Result)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-result.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_RESULT }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Render ECS Task Definition (Worker)
+        id: render-worker
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEF_WORKER }}
+          container-name: ${{ env.CONTAINER_WORKER }}
+          image: ${{ steps.set-images.outputs.worker_image }}
+
+      - name: Deploy ECS Task Definition (Worker)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-worker.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_WORKER }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Deployment Complete
+        run: echo "ECS Deployment completed successfully!"
+
+  notif:
+    name: Send Notification via SNS (Production)
+    runs-on: ubuntu-latest
+    needs: deploy
+    environment: Production
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
@@ -104,12 +154,11 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy Stack
+      - name: Publish Message To SNS Subscribers
+        env:
+          TOPIC_ARN: ${{ secrets.AWS_SNS_ARN }}
         run: |
-          echo "Redeploying Docker Swarm stack..."
-          docker stack rm vote || true
-          sleep 20
-          docker stack deploy -c docker-stack.yml vote
-          echo "Stack deployed successfully."
-          docker stack ps vote
-          docker service ls
+          aws sns publish \
+            --topic-arn "$TOPIC_ARN" \
+            --subject "Deployment Notification" \
+            --message "New production version of LKS Voting App has been successfully deployed!"
